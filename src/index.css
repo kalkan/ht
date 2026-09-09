@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Semantic colour tokens (RGB triplets so Tailwind can apply opacity). */
+:root {
+  --c-bg: 245 245 247;
+  --c-card: 255 255 255;
+  --c-elevated: 242 242 247;
+  --c-ink: 17 17 20;
+  --c-muted: 110 110 120;
+  --c-faint: 170 170 180;
+  --c-line: 229 229 234;
+  --c-accent: 0 122 255;
+  --c-accent-ink: 255 255 255;
+  --c-success: 36 161 72;
+  --c-warning: 224 137 0;
+  --c-danger: 227 53 47;
+  color-scheme: light;
+}
+
+.dark {
+  --c-bg: 0 0 0;
+  --c-card: 28 28 30;
+  --c-elevated: 44 44 46;
+  --c-ink: 245 245 247;
+  --c-muted: 160 160 170;
+  --c-faint: 110 110 120;
+  --c-line: 58 58 62;
+  --c-accent: 10 132 255;
+  --c-accent-ink: 255 255 255;
+  --c-success: 48 209 88;
+  --c-warning: 255 159 10;
+  --c-danger: 255 69 58;
+  color-scheme: dark;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+  background-color: rgb(var(--c-bg));
+}
+
+body {
+  margin: 0;
+  font-family: theme('fontFamily.sans');
+  color: rgb(var(--c-ink));
+  background-color: rgb(var(--c-bg));
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior-y: none;
+}
+
+/* Prevent iOS zoom on focus: inputs must be >= 16px. */
+input,
+textarea,
+select {
+  font-size: 16px;
+}
+
+button {
+  touch-action: manipulation;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

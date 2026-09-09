@@ -1,0 +1,22 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+dev-dist
+*.tsbuildinfo
+
+# Environment (never commit real secrets)
+.env
+.env.local
+.env.*.local
+
+# Editor / OS
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# Logs
+npm-debug.log*
+*.log
