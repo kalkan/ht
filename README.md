@@ -127,14 +127,14 @@ See [`.env.example`](.env.example). Vite inlines `VITE_*` variables into the bui
 
 The workflow in [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) builds and deploys on every push to `main`.
 
-1. Push this repository to GitHub (e.g. `USERNAME/daily-tracker`).
+1. Push this repository to GitHub (this project lives at `kalkan/ht`; the examples below use `daily-tracker` as a generic name).
 2. **Settings → Pages → Build and deployment → Source:** choose **GitHub Actions**.
 3. **Settings → Secrets and variables → Actions → New repository secret**, add:
    - `VITE_APPS_SCRIPT_URL`
    - `VITE_APP_SECRET`
    (Skip these for a local-only deployment.)
 4. Push to `main` (or run the workflow manually under **Actions → Deploy to GitHub Pages → Run workflow**).
-5. The app is served at `https://USERNAME.github.io/daily-tracker/`.
+5. The app is served at `https://USERNAME.github.io/<repository-name>/`, for this repository `https://kalkan.github.io/ht/`.
 
 The workflow sets `VITE_BASE_PATH=/<repository-name>/` automatically, so Vite's `base`, the manifest `start_url`/`scope`, and the service worker navigation fallback all use the correct sub-path. If you deploy to a user site (`USERNAME.github.io` repository), change that env line to `VITE_BASE_PATH: /`. A `404.html` copy of `index.html` is added so deep links work on Pages.
 
