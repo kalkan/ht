@@ -10,7 +10,7 @@ import { useToast } from '../hooks/useToast';
 import { META_KEYS, clearAllLocalData, db, getMeta, setMeta } from '../db/database';
 import { IS_DEV } from '../services/config';
 import { isSeeded, removeSeedData, seedDatabase } from '../services/seed';
-import { deleteAllCloudData, syncNow, testConnection } from '../services/syncService';
+import { deleteAllCloudData, syncNow, testConnection, updateCloudSecret } from '../services/syncService';
 import { createBackup, parseBackup, serializeBackup, toCsv } from '../utils/backup';
 import { formatDateTimeTr, formatLongDateTr, nowIso, todayKey } from '../utils/dateUtils';
 import { downloadTextFile, readFileAsText } from '../utils/download';
@@ -30,6 +30,9 @@ export function SettingsPage() {
 
   const [syncing, setSyncing] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [secretInput, setSecretInput] = useState('');
+  const [editingSecret, setEditingSecret] = useState(false);
+  const [savingSecret, setSavingSecret] = useState(false);
   const [lastBackupAt, setLastBackupAt] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<'local' | 'all' | 'import' | null>(null);
   const [pendingImport, setPendingImport] = useState<ReturnType<typeof parseBackup> | null>(null);
@@ -49,6 +52,39 @@ export function SettingsPage() {
     setSyncing(false);
     if (r.ok) show(`Senkronize edildi (${r.pushed} gönderildi, ${r.pulled} alındı).`, 'success');
     else show(r.error ?? 'Senkronizasyon başarısız.', 'error');
+  };
+
+  const onSaveSecret = async () => {
+    const value = secretInput.trim();
+    if (value.length < 6) {
+      show('Anahtar en az 6 karakter olmalı.', 'error');
+      return;
+    }
+    setSavingSecret(true);
+    try {
+      const r = await updateCloudSecret(value);
+      if (r?.ok) {
+        show('Bulut bağlantısı kuruldu ve senkronize edildi.', 'success');
+      } else if (r?.error?.includes('anahtarı hatalı')) {
+        // Server rejected the key: do not keep it, let the user try again.
+        await updateCloudSecret('');
+        show(r.error, 'error');
+        return;
+      } else {
+        show(r?.error ? `Anahtar kaydedildi. ${r.error}` : 'Anahtar kaydedildi, senkronizasyon başarısız.', 'info');
+      }
+      setEditingSecret(false);
+      setSecretInput('');
+    } finally {
+      setSavingSecret(false);
+    }
+  };
+
+  const onRemoveSecret = async () => {
+    await updateCloudSecret('');
+    setEditingSecret(false);
+    setSecretInput('');
+    show('Bulut bağlantısı kaldırıldı. Veriler cihazda kalmaya devam eder.', 'info');
   };
 
   const onTest = async () => {
@@ -175,12 +211,12 @@ export function SettingsPage() {
     <div className="flex flex-col gap-3">
       <PageHeader eyebrow="Ayarlar" title="Ayarlar" />
 
-      <Card title="Senkronizasyon">
+      <Card title="Bulut senkronizasyonu">
         <Row
-          label="Google Sheets bağlantısı"
+          label="Bağlantı"
           value={
             <span className={cx(sync.configured ? (sync.phase === 'error' ? 'text-danger' : 'text-success') : 'text-muted')}>
-              {sync.configured ? (sync.phase === 'error' ? 'Hata' : 'Yapılandırıldı') : 'Yapılandırılmadı'}
+              {sync.configured ? (sync.phase === 'error' ? 'Hata' : 'Bağlı') : 'Yapılandırılmadı'}
             </span>
           }
         />
@@ -188,21 +224,61 @@ export function SettingsPage() {
         <Row label="Son senkronizasyon" value={formatDateTimeTr(sync.lastSyncAt)} />
         <Row label="Bekleyen kayıt" value={sync.pendingCount} />
         {sync.lastError && <p className="mt-2 text-[13px] text-danger">{sync.lastError}</p>}
-        {!sync.configured && (
-          <p className="mt-3 text-[13px] leading-relaxed text-muted">
-            Uygulama yalnızca bu cihazda çalışıyor. Bulut yedeği için README'deki Google Apps Script kurulumunu tamamlayıp{' '}
-            <code className="rounded bg-elevated px-1">VITE_APPS_SCRIPT_URL</code> ve{' '}
-            <code className="rounded bg-elevated px-1">VITE_APP_SECRET</code> değerlerini ayarlayın.
-          </p>
+
+        {(!sync.configured || editingSecret) && (
+          <div className="mt-4">
+            {!sync.configured && (
+              <p className="mb-3 text-[13px] leading-relaxed text-muted">
+                Uygulama şu an yalnızca bu cihazda çalışıyor. Yedekleme ve diğer cihazlarla eşitleme için Netlify'da
+                tanımladığınız <code className="rounded bg-elevated px-1">APP_SECRET</code> değerini girin.
+              </p>
+            )}
+            <label className="block">
+              <span className="text-[13px] font-medium text-muted">Bulut anahtarı</span>
+              <input
+                type="password"
+                value={secretInput}
+                onChange={(e) => setSecretInput(e.target.value)}
+                autoComplete="off"
+                autoCapitalize="none"
+                autoCorrect="off"
+                placeholder="APP_SECRET"
+                className="mt-1.5 w-full rounded-2xl border border-line bg-elevated px-4 py-3 text-[16px] text-ink focus:outline-none focus:ring-2 focus:ring-accent/60"
+              />
+            </label>
+            <div className={cx('mt-2 grid gap-2', editingSecret ? 'grid-cols-2' : 'grid-cols-1')}>
+              <Button onClick={onSaveSecret} loading={savingSecret}>
+                Bağlan
+              </Button>
+              {editingSecret && (
+                <Button variant="secondary" onClick={() => { setEditingSecret(false); setSecretInput(''); }}>
+                  Vazgeç
+                </Button>
+              )}
+            </div>
+          </div>
         )}
-        <div className="mt-4 grid grid-cols-[1fr_auto] gap-2">
-          <Button onClick={onSync} loading={syncing || sync.phase === 'syncing'} disabled={!sync.configured}>
-            Şimdi Senkronize Et
-          </Button>
-          <Button variant="secondary" onClick={onTest} loading={testing} disabled={!sync.configured}>
-            Test
-          </Button>
-        </div>
+
+        {sync.configured && !editingSecret && (
+          <>
+            <div className="mt-4 grid grid-cols-[1fr_auto] gap-2">
+              <Button onClick={onSync} loading={syncing || sync.phase === 'syncing'}>
+                Şimdi Senkronize Et
+              </Button>
+              <Button variant="secondary" onClick={onTest} loading={testing}>
+                Test
+              </Button>
+            </div>
+            <div className="mt-2 flex justify-between text-[13px]">
+              <button type="button" onClick={() => setEditingSecret(true)} className="font-semibold text-accent">
+                Anahtarı değiştir
+              </button>
+              <button type="button" onClick={onRemoveSecret} className="font-semibold text-danger">
+                Bağlantıyı kaldır
+              </button>
+            </div>
+          </>
+        )}
       </Card>
 
       <Card title="Görünüm">
@@ -293,12 +369,12 @@ export function SettingsPage() {
         </Card>
       )}
 
-      <p className="pb-2 text-center text-[12px] text-faint">Daily v{__APP_VERSION__} · Veriler yalnızca bu cihazda ve kendi Google Sheet'inizde tutulur.</p>
+      <p className="pb-2 text-center text-[12px] text-faint">Daily v{__APP_VERSION__} · Veriler yalnızca bu cihazda ve kendi veritabanınızda tutulur.</p>
 
       <ConfirmDialog
         open={confirm === 'local'}
         title="Yerel verileri sil"
-        message={`Bu cihazdaki ${logs.length} kayıt silinecek. Google Sheets'teki veriler korunur ve bir sonraki senkronizasyonda geri gelir.`}
+        message={`Bu cihazdaki ${logs.length} kayıt silinecek. Buluttaki veriler korunur ve bir sonraki senkronizasyonda geri gelir.`}
         confirmLabel="Yerel Verileri Sil"
         typeToConfirm="SİL"
         danger
@@ -308,7 +384,7 @@ export function SettingsPage() {
       <ConfirmDialog
         open={confirm === 'all'}
         title="Tüm verileri sil"
-        message={'Hem bu cihazdaki hem de Google Sheets\'teki TÜM kayıtlar kalıcı olarak silinecek.\n\nBu işlem geri alınamaz.'}
+        message={'Hem bu cihazdaki hem de buluttaki TÜM kayıtlar kalıcı olarak silinecek.\n\nBu işlem geri alınamaz.'}
         confirmLabel="Hepsini Sil"
         typeToConfirm="HEPSİNİ SİL"
         danger

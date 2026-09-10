@@ -6,13 +6,15 @@
  *     with last-write-wins on `updatedAt` (documented in README).
  *  3. Failures never block local usage: rows stay `pending`/`error` and are
  *     retried on app start, on reconnect, and on manual "Şimdi Senkronize Et".
+ *
+ * The backend is the Netlify Function in netlify/functions/logs.mts (Neon Postgres).
  */
 import { META_KEYS, db, getMeta, getPendingLogs, setMeta, deleteMeta } from '../db/database';
 import type { DailyLog } from '../types/DailyLog';
 import { nowIso } from '../utils/dateUtils';
-import { CLOUD_SYNC_CONFIGURED } from './config';
+import { isCloudConfigured, onCloudSecretChange, setCloudSecret } from './config';
 import { getDeviceId } from './deviceId';
-import * as api from './googleApi';
+import * as api from './cloudApi';
 
 export type SyncPhase = 'idle' | 'syncing' | 'error' | 'unconfigured' | 'offline';
 
@@ -29,11 +31,11 @@ type Listener = (state: SyncState) => void;
 
 const listeners = new Set<Listener>();
 let state: SyncState = {
-  phase: CLOUD_SYNC_CONFIGURED ? 'idle' : 'unconfigured',
+  phase: isCloudConfigured() ? 'idle' : 'unconfigured',
   lastSyncAt: null,
   lastError: null,
   pendingCount: 0,
-  configured: CLOUD_SYNC_CONFIGURED,
+  configured: isCloudConfigured(),
   online: typeof navigator === 'undefined' ? true : navigator.onLine,
 };
 let inFlight: Promise<SyncResult> | null = null;
@@ -85,7 +87,7 @@ export async function refreshSyncState(): Promise<void> {
 }
 
 function derivePhase(lastError: string | null): SyncPhase {
-  if (!CLOUD_SYNC_CONFIGURED) return 'unconfigured';
+  if (!isCloudConfigured()) return 'unconfigured';
   if (!state.online) return 'offline';
   return lastError ? 'error' : 'idle';
 }
@@ -123,7 +125,7 @@ export async function mergeRemoteIntoLocal(remote: DailyLog[]): Promise<number> 
 }
 
 async function runSync(): Promise<SyncResult> {
-  if (!CLOUD_SYNC_CONFIGURED) {
+  if (!isCloudConfigured()) {
     patch({ phase: 'unconfigured' });
     return { ok: false, pushed: 0, pulled: 0, error: 'Bulut senkronizasyonu yapılandırılmadı.' };
   }
@@ -191,7 +193,7 @@ export function syncNow(): Promise<SyncResult> {
 
 /** Fire-and-forget background sync used after saves. Never throws. */
 export function syncInBackground(): void {
-  if (!CLOUD_SYNC_CONFIGURED || !state.online) {
+  if (!isCloudConfigured() || !state.online) {
     void refreshSyncState();
     return;
   }
@@ -202,7 +204,7 @@ export function syncInBackground(): void {
 export async function deleteDateEverywhere(date: string): Promise<{ cloudOk: boolean }> {
   await db.dailyLogs.where('date').equals(date).delete();
   await refreshSyncState();
-  if (!CLOUD_SYNC_CONFIGURED || !state.online) return { cloudOk: false };
+  if (!isCloudConfigured() || !state.online) return { cloudOk: false };
   try {
     await api.deleteByDate(date);
     return { cloudOk: true };
@@ -219,12 +221,30 @@ export async function testConnection(): Promise<boolean> {
   return api.ping();
 }
 
+/**
+ * Store (or clear) the cloud secret and immediately try a sync with it.
+ * Any previous sync error is cleared because it may have been caused by the old secret.
+ */
+export async function updateCloudSecret(secret: string): Promise<SyncResult | null> {
+  setCloudSecret(secret);
+  try {
+    await deleteMeta(META_KEYS.lastSyncError);
+  } catch {
+    /* ignore */
+  }
+  patch({ configured: isCloudConfigured(), lastError: null, phase: derivePhase(null) });
+  if (!isCloudConfigured()) return null;
+  return syncNow();
+}
+
 let started = false;
 
 /** Wire up online/offline listeners and run the initial sync. Idempotent. */
 export function startSyncService(): void {
   if (started || typeof window === 'undefined') return;
   started = true;
+
+  onCloudSecretChange(() => patch({ configured: isCloudConfigured(), phase: derivePhase(state.lastError) }));
 
   window.addEventListener('online', () => {
     patch({ online: true, phase: derivePhase(state.lastError) });

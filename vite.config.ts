@@ -6,12 +6,8 @@ import { readFileSync } from 'node:fs';
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8')) as { version: string };
 
 /**
- * Base path for GitHub Pages.
- *
- * - `npm run dev` / local preview  -> "/"
- * - GitHub Actions deploy          -> "/<repo-name>/" (set via VITE_BASE_PATH)
- *
- * For a user/organization site (username.github.io) VITE_BASE_PATH should be "/".
+ * Base path. Netlify serves the app from the site root, so this stays "/".
+ * VITE_BASE_PATH is only needed when hosting under a sub-path.
  */
 const base = process.env.VITE_BASE_PATH ?? '/';
 
