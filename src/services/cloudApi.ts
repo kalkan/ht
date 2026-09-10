@@ -1,129 +1,104 @@
 /**
- * Client for the Netlify Function backend (netlify/functions/logs.mts).
- * JSON over POST, authenticated with "Authorization: Bearer <secret>".
+ * Firestore client using the REST API (no SDK). Documents live at
+ *   users/{uid}/dailyLogs/{date}
+ * and are protected by firestore.rules (owner-only, last-write-wins on updatedAt).
  */
-import type { DailyLog, RemoteDailyLog } from '../types/DailyLog';
+import type { DailyLog } from '../types/DailyLog';
 import { isWorkoutType } from '../types/DailyLog';
 import { isValidDateKey } from '../utils/dateUtils';
-import { CLOUD_API_URL, getCloudSecret, isCloudConfigured } from './config';
+import { CLOUD_CONFIGURED, FIREBASE_PROJECT_ID, FIRESTORE_URL } from './config';
+import { AuthError, getIdToken, getSession } from './firebaseAuth';
 
 const REQUEST_TIMEOUT_MS = 20_000;
+const PAGE_SIZE = 300;
+const BATCH_SIZE = 400; // Firestore allows 500 writes per commit
 
 export class ApiError extends Error {
   constructor(
     message: string,
-    public readonly kind: 'network' | 'timeout' | 'http' | 'invalid' | 'rejected' | 'unauthorized' | 'unconfigured',
+    public readonly kind: 'network' | 'timeout' | 'http' | 'invalid' | 'rejected' | 'unauthorized' | 'unconfigured' | 'signedOut',
   ) {
     super(message);
     this.name = 'ApiError';
   }
 }
 
-type ApiResponse<T> = { success: true; data: T } | { success: false; error: string };
+// ---------- Firestore value mapping ----------
 
-async function call<T>(action: string, payload: Record<string, unknown> = {}): Promise<T> {
-  if (!isCloudConfigured()) throw new ApiError('Bulut senkronizasyonu yapılandırılmadı.', 'unconfigured');
+type FsValue =
+  | { stringValue: string }
+  | { integerValue: string | number }
+  | { doubleValue: number }
+  | { booleanValue: boolean }
+  | { nullValue: null };
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  let res: Response;
-  try {
-    res = await fetch(CLOUD_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${getCloudSecret()}`,
-      },
-      body: JSON.stringify({ action, ...payload }),
-      signal: controller.signal,
-      cache: 'no-store',
-    });
-  } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new ApiError('Bulut isteği zaman aşımına uğradı.', 'timeout');
-    }
-    throw new ApiError('Bulut sunucusuna ulaşılamadı.', 'network');
-  } finally {
-    clearTimeout(timer);
-  }
-
-  let json: unknown = null;
-  try {
-    json = await res.json();
-  } catch {
-    if (res.status === 401) throw new ApiError('Bulut anahtarı hatalı.', 'unauthorized');
-    throw new ApiError(`Geçersiz sunucu yanıtı (HTTP ${res.status}).`, 'invalid');
-  }
-  if (!json || typeof json !== 'object' || typeof (json as ApiResponse<T>).success !== 'boolean') {
-    throw new ApiError('Beklenmeyen sunucu yanıtı.', 'invalid');
-  }
-  const body = json as ApiResponse<T>;
-  if (!body.success) {
-    if (res.status === 401) throw new ApiError('Bulut anahtarı hatalı.', 'unauthorized');
-    if (res.status >= 500) throw new ApiError(`Sunucu hatası: ${body.error}`, 'http');
-    throw new ApiError(body.error || 'Sunucu isteği reddetti.', 'rejected');
-  }
-  if (!res.ok) throw new ApiError(`Sunucu hatası (HTTP ${res.status}).`, 'http');
-  return body.data;
+export interface FsDocument {
+  name?: string;
+  fields?: Record<string, FsValue>;
+  updateTime?: string;
 }
 
-// ---------- mapping ----------
+const docsRoot = () => `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
+const collectionPath = (uid: string) => `users/${encodeURIComponent(uid)}/dailyLogs`;
+const docName = (uid: string, date: string) => `${docsRoot()}/users/${uid}/dailyLogs/${date}`;
 
-export function toRemote(log: DailyLog, deviceId: string): RemoteDailyLog {
+export function toFirestoreFields(log: DailyLog, deviceId: string): Record<string, FsValue> {
   return {
-    id: log.id,
-    date: log.date,
-    workout: log.workout,
-    cigarettes: log.cigarettes,
-    water_enough: log.waterEnough,
-    alcohol: log.alcohol,
-    healthy_diet: log.healthyDiet,
-    weight: typeof log.weight === 'number' ? log.weight : null,
-    created_at: log.createdAt,
-    updated_at: log.updatedAt,
-    device_id: deviceId,
+    id: { stringValue: log.id },
+    date: { stringValue: log.date },
+    workout: { stringValue: log.workout },
+    cigarettes: { integerValue: String(log.cigarettes) },
+    waterEnough: { booleanValue: log.waterEnough },
+    alcohol: { booleanValue: log.alcohol },
+    healthyDiet: { booleanValue: log.healthyDiet },
+    weight: typeof log.weight === 'number' ? { doubleValue: log.weight } : { nullValue: null },
+    createdAt: { stringValue: log.createdAt },
+    updatedAt: { stringValue: log.updatedAt },
+    deviceId: { stringValue: deviceId },
   };
 }
 
-function toBool(v: unknown): boolean | null {
-  if (typeof v === 'boolean') return v;
-  if (v === 1 || v === 0) return v === 1;
-  if (typeof v === 'string') {
-    const s = v.trim().toLowerCase();
-    if (s === 'true' || s === '1') return true;
-    if (s === 'false' || s === '0') return false;
-  }
+function str(v: FsValue | undefined): string | null {
+  return v && 'stringValue' in v ? v.stringValue : null;
+}
+function bool(v: FsValue | undefined): boolean | null {
+  return v && 'booleanValue' in v ? v.booleanValue : null;
+}
+function num(v: FsValue | undefined): number | null {
+  if (!v) return null;
+  if ('integerValue' in v) return Number(v.integerValue);
+  if ('doubleValue' in v) return Number(v.doubleValue);
   return null;
 }
-
-function toIso(v: unknown): string | null {
-  if (typeof v !== 'string' && typeof v !== 'number') return null;
+function isoOrNull(v: string | null): string | null {
+  if (!v) return null;
   const d = new Date(v);
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-/** Convert a server row into a DailyLog; null for malformed rows so one bad row never breaks sync. */
-export function fromRemote(raw: unknown): DailyLog | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const r = raw as Record<string, unknown>;
-  if (!isValidDateKey(r.date)) return null;
-  if (!isWorkoutType(r.workout)) return null;
-  const cigarettes = Number(r.cigarettes);
-  if (!Number.isFinite(cigarettes) || cigarettes < 0) return null;
-  const waterEnough = toBool(r.water_enough);
-  const alcohol = toBool(r.alcohol);
-  const healthyDiet = toBool(r.healthy_diet);
+/** Convert a Firestore document into a DailyLog; null for malformed docs so one bad doc never breaks sync. */
+export function fromFirestoreDoc(doc: FsDocument): DailyLog | null {
+  const f = doc.fields;
+  if (!f) return null;
+  const date = str(f.date) ?? doc.name?.split('/').pop() ?? null;
+  if (!isValidDateKey(date)) return null;
+  const workout = str(f.workout);
+  if (!isWorkoutType(workout)) return null;
+  const cigarettes = num(f.cigarettes);
+  if (cigarettes === null || !Number.isFinite(cigarettes) || cigarettes < 0) return null;
+  const waterEnough = bool(f.waterEnough);
+  const alcohol = bool(f.alcohol);
+  const healthyDiet = bool(f.healthyDiet);
   if (waterEnough === null || alcohol === null || healthyDiet === null) return null;
-  const createdAt = toIso(r.created_at);
-  const updatedAt = toIso(r.updated_at) ?? createdAt;
+  const createdAt = isoOrNull(str(f.createdAt));
+  const updatedAt = isoOrNull(str(f.updatedAt)) ?? createdAt;
   if (!createdAt || !updatedAt) return null;
-  const id = typeof r.id === 'string' && r.id.length > 0 ? r.id : null;
+  const id = str(f.id);
   if (!id) return null;
-
   const log: DailyLog = {
     id,
-    date: r.date,
-    workout: r.workout,
+    date,
+    workout,
     cigarettes: Math.round(cigarettes),
     waterEnough,
     alcohol,
@@ -132,48 +107,127 @@ export function fromRemote(raw: unknown): DailyLog | null {
     updatedAt,
     syncStatus: 'synced',
   };
-  const w = r.weight;
-  if (w !== null && w !== undefined && w !== '') {
-    const n = Number(typeof w === 'string' ? w.replace(',', '.') : w);
-    if (Number.isFinite(n) && n > 0) log.weight = Math.round(n * 10) / 10;
-  }
+  const w = num(f.weight);
+  if (w !== null && Number.isFinite(w) && w > 0) log.weight = Math.round(w * 10) / 10;
   return log;
+}
+
+// ---------- HTTP ----------
+
+async function request<T>(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown, retry = true): Promise<T> {
+  if (!CLOUD_CONFIGURED) throw new ApiError('Bulut senkronizasyonu yapılandırılmadı.', 'unconfigured');
+  if (!getSession()) throw new ApiError('Giriş yapılmadı.', 'signedOut');
+
+  let token: string;
+  try {
+    token = await getIdToken();
+  } catch (err) {
+    if (err instanceof AuthError && (err.code === 'NETWORK' || err.code === 'TIMEOUT')) throw new ApiError(err.message, 'network');
+    throw new ApiError(err instanceof Error ? err.message : 'Oturum geçersiz.', 'unauthorized');
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(`${FIRESTORE_URL}/${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') throw new ApiError('Bulut isteği zaman aşımına uğradı.', 'timeout');
+    throw new ApiError('Firestore sunucusuna ulaşılamadı.', 'network');
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let json: unknown = null;
+  try {
+    json = res.status === 204 ? {} : await res.json();
+  } catch {
+    throw new ApiError(`Geçersiz sunucu yanıtı (HTTP ${res.status}).`, 'invalid');
+  }
+  if (!res.ok) {
+    const err = (json as { error?: { status?: string; message?: string } } | null)?.error;
+    if (res.status === 401 && retry) {
+      // ID token rejected: refresh once and retry.
+      await getIdToken(true).catch(() => undefined);
+      return request<T>(method, path, body, false);
+    }
+    if (res.status === 401) throw new ApiError('Oturum geçersiz. Lütfen tekrar giriş yapın.', 'unauthorized');
+    if (res.status === 403) throw new ApiError('Erişim reddedildi. Firestore kurallarını kontrol edin.', 'rejected');
+    throw new ApiError(`Firestore hatası: ${err?.message ?? `HTTP ${res.status}`}`, 'http');
+  }
+  return json as T;
 }
 
 // ---------- API surface ----------
 
 export async function ping(): Promise<boolean> {
-  const data = await call<{ ok: boolean }>('ping');
-  return Boolean(data && data.ok);
+  const uid = getSession()?.uid ?? '';
+  await request<{ documents?: FsDocument[] }>('GET', `${docsRoot()}/${collectionPath(uid)}?pageSize=1`);
+  return true;
 }
 
 export async function getAll(): Promise<DailyLog[]> {
-  const rows = await call<unknown[]>('getAll');
-  if (!Array.isArray(rows)) throw new ApiError('Sunucu liste döndürmedi.', 'invalid');
-  return rows.map(fromRemote).filter((l): l is DailyLog => l !== null);
+  const uid = getSession()?.uid ?? '';
+  const out: DailyLog[] = [];
+  let pageToken: string | undefined;
+  do {
+    const qs = new URLSearchParams({ pageSize: String(PAGE_SIZE) });
+    if (pageToken) qs.set('pageToken', pageToken);
+    const page = await request<{ documents?: FsDocument[]; nextPageToken?: string }>(
+      'GET',
+      `${docsRoot()}/${collectionPath(uid)}?${qs.toString()}`,
+    );
+    for (const doc of page.documents ?? []) {
+      const log = fromFirestoreDoc(doc);
+      if (log) out.push(log);
+    }
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+  return out;
 }
 
 export async function getByDate(date: string): Promise<DailyLog | null> {
-  const row = await call<unknown>('getByDate', { date });
-  return row ? fromRemote(row) : null;
-}
-
-export async function upsert(log: DailyLog, deviceId: string): Promise<void> {
-  await call('upsert', { data: toRemote(log, deviceId) });
-}
-
-/** Upsert many rows in one request; the server enforces one row per date. */
-export async function upsertMany(logs: DailyLog[], deviceId: string): Promise<void> {
-  for (let i = 0; i < logs.length; i += 200) {
-    const chunk = logs.slice(i, i + 200);
-    await call('upsertMany', { data: chunk.map((l) => toRemote(l, deviceId)) });
+  const uid = getSession()?.uid ?? '';
+  try {
+    const doc = await request<FsDocument>('GET', docName(uid, date));
+    return fromFirestoreDoc(doc);
+  } catch (err) {
+    if (err instanceof ApiError && err.kind === 'http' && /NOT_FOUND|404/.test(err.message)) return null;
+    throw err;
   }
 }
 
+/** Write many rows in commits of up to BATCH_SIZE. The rules enforce one doc per date and last-write-wins. */
+export async function upsertMany(logs: DailyLog[], deviceId: string): Promise<void> {
+  const uid = getSession()?.uid ?? '';
+  for (let i = 0; i < logs.length; i += BATCH_SIZE) {
+    const writes = logs.slice(i, i + BATCH_SIZE).map((log) => ({
+      update: { name: docName(uid, log.date), fields: toFirestoreFields(log, deviceId) },
+    }));
+    await request('POST', `${docsRoot()}:commit`, { writes });
+  }
+}
+
+export async function upsert(log: DailyLog, deviceId: string): Promise<void> {
+  await upsertMany([log], deviceId);
+}
+
 export async function deleteByDate(date: string): Promise<void> {
-  await call('delete', { date });
+  const uid = getSession()?.uid ?? '';
+  await request('DELETE', docName(uid, date));
 }
 
 export async function deleteAll(): Promise<void> {
-  await call('deleteAll', { confirm: 'DELETE_ALL' });
+  const uid = getSession()?.uid ?? '';
+  const all = await getAll();
+  for (let i = 0; i < all.length; i += BATCH_SIZE) {
+    const writes = all.slice(i, i + BATCH_SIZE).map((log) => ({ delete: docName(uid, log.date) }));
+    await request('POST', `${docsRoot()}:commit`, { writes });
+  }
 }

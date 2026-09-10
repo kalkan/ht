@@ -9,6 +9,9 @@ export function SyncBadge({ className }: { className?: string }) {
   if (!s.configured) {
     label = 'Yalnızca yerel';
     dot = 'bg-faint';
+  } else if (!s.signedIn) {
+    label = 'Giriş yapılmadı';
+    dot = 'bg-faint';
   } else if (s.phase === 'syncing') {
     label = 'Senkronize ediliyor…';
     dot = 'bg-accent animate-pulse';

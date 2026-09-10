@@ -7,35 +7,46 @@
  *  3. Failures never block local usage: rows stay `pending`/`error` and are
  *     retried on app start, on reconnect, and on manual "Şimdi Senkronize Et".
  *
- * The backend is the Netlify Function in netlify/functions/logs.mts (Neon Postgres).
+ * The backend is Firestore (users/{uid}/dailyLogs/{date}) behind Firebase
+ * Email/Password auth; see services/cloudApi.ts and firestore.rules.
  */
 import { META_KEYS, db, getMeta, getPendingLogs, setMeta, deleteMeta } from '../db/database';
 import type { DailyLog } from '../types/DailyLog';
 import { nowIso } from '../utils/dateUtils';
-import { isCloudConfigured, onCloudSecretChange, setCloudSecret } from './config';
+import { CLOUD_CONFIGURED } from './config';
 import { getDeviceId } from './deviceId';
 import * as api from './cloudApi';
+import { getSession, isSignedIn, onAuthChange, signIn, signOut } from './firebaseAuth';
 
-export type SyncPhase = 'idle' | 'syncing' | 'error' | 'unconfigured' | 'offline';
+export type SyncPhase = 'idle' | 'syncing' | 'error' | 'unconfigured' | 'signedOut' | 'offline';
 
 export interface SyncState {
   phase: SyncPhase;
   lastSyncAt: string | null;
   lastError: string | null;
   pendingCount: number;
+  /** Firebase project configured at build time. */
   configured: boolean;
+  signedIn: boolean;
+  userEmail: string | null;
   online: boolean;
 }
 
 type Listener = (state: SyncState) => void;
 
 const listeners = new Set<Listener>();
+function canSync(): boolean {
+  return CLOUD_CONFIGURED && isSignedIn();
+}
+
 let state: SyncState = {
-  phase: isCloudConfigured() ? 'idle' : 'unconfigured',
+  phase: !CLOUD_CONFIGURED ? 'unconfigured' : isSignedIn() ? 'idle' : 'signedOut',
   lastSyncAt: null,
   lastError: null,
   pendingCount: 0,
-  configured: isCloudConfigured(),
+  configured: CLOUD_CONFIGURED,
+  signedIn: isSignedIn(),
+  userEmail: getSession()?.email ?? null,
   online: typeof navigator === 'undefined' ? true : navigator.onLine,
 };
 let inFlight: Promise<SyncResult> | null = null;
@@ -87,7 +98,8 @@ export async function refreshSyncState(): Promise<void> {
 }
 
 function derivePhase(lastError: string | null): SyncPhase {
-  if (!isCloudConfigured()) return 'unconfigured';
+  if (!CLOUD_CONFIGURED) return 'unconfigured';
+  if (!isSignedIn()) return 'signedOut';
   if (!state.online) return 'offline';
   return lastError ? 'error' : 'idle';
 }
@@ -125,9 +137,13 @@ export async function mergeRemoteIntoLocal(remote: DailyLog[]): Promise<number> 
 }
 
 async function runSync(): Promise<SyncResult> {
-  if (!isCloudConfigured()) {
+  if (!CLOUD_CONFIGURED) {
     patch({ phase: 'unconfigured' });
     return { ok: false, pushed: 0, pulled: 0, error: 'Bulut senkronizasyonu yapılandırılmadı.' };
+  }
+  if (!isSignedIn()) {
+    patch({ phase: 'signedOut' });
+    return { ok: false, pushed: 0, pulled: 0, error: 'Giriş yapılmadı.' };
   }
   if (!state.online) {
     patch({ phase: 'offline' });
@@ -193,7 +209,7 @@ export function syncNow(): Promise<SyncResult> {
 
 /** Fire-and-forget background sync used after saves. Never throws. */
 export function syncInBackground(): void {
-  if (!isCloudConfigured() || !state.online) {
+  if (!canSync() || !state.online) {
     void refreshSyncState();
     return;
   }
@@ -204,7 +220,7 @@ export function syncInBackground(): void {
 export async function deleteDateEverywhere(date: string): Promise<{ cloudOk: boolean }> {
   await db.dailyLogs.where('date').equals(date).delete();
   await refreshSyncState();
-  if (!isCloudConfigured() || !state.online) return { cloudOk: false };
+  if (!canSync() || !state.online) return { cloudOk: false };
   try {
     await api.deleteByDate(date);
     return { cloudOk: true };
@@ -221,20 +237,27 @@ export async function testConnection(): Promise<boolean> {
   return api.ping();
 }
 
-/**
- * Store (or clear) the cloud secret and immediately try a sync with it.
- * Any previous sync error is cleared because it may have been caused by the old secret.
- */
-export async function updateCloudSecret(secret: string): Promise<SyncResult | null> {
-  setCloudSecret(secret);
+/** Sign in with Firebase Email/Password and immediately sync. Throws AuthError on failure. */
+export async function signInAndSync(email: string, password: string): Promise<SyncResult> {
+  await signIn(email, password);
   try {
     await deleteMeta(META_KEYS.lastSyncError);
   } catch {
     /* ignore */
   }
-  patch({ configured: isCloudConfigured(), lastError: null, phase: derivePhase(null) });
-  if (!isCloudConfigured()) return null;
+  patch({ signedIn: true, userEmail: getSession()?.email ?? email, lastError: null, phase: derivePhase(null) });
   return syncNow();
+}
+
+/** Sign out. Local data is kept; the next sign-in merges again. */
+export async function signOutCloud(): Promise<void> {
+  signOut();
+  try {
+    await deleteMeta(META_KEYS.lastSyncError);
+  } catch {
+    /* ignore */
+  }
+  patch({ signedIn: false, userEmail: null, lastError: null, phase: derivePhase(null) });
 }
 
 let started = false;
@@ -244,7 +267,10 @@ export function startSyncService(): void {
   if (started || typeof window === 'undefined') return;
   started = true;
 
-  onCloudSecretChange(() => patch({ configured: isCloudConfigured(), phase: derivePhase(state.lastError) }));
+  // Token refresh failures sign the user out; reflect that in the UI.
+  onAuthChange((session) =>
+    patch({ signedIn: session !== null, userEmail: session?.email ?? null, phase: derivePhase(state.lastError) }),
+  );
 
   window.addEventListener('online', () => {
     patch({ online: true, phase: derivePhase(state.lastError) });
